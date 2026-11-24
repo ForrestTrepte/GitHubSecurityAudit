@@ -11,13 +11,10 @@
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
 
-  // Keep Claude Code's config and login in a named volume so they survive
-  // container rebuilds. CLAUDE_CONFIG_DIR moves ~/.claude.json into it too.
-  "mounts": [
-    "source=claude-code-config-${devcontainerId},target=/home/vscode/.claude,type=volume"
-  ],
   "containerEnv": {
-    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+    // The uv cache and the workspace are on different filesystems in
+    // Codespaces, so hardlinking fails; copy instead to avoid warnings.
+    "UV_LINK_MODE": "copy"
   },
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
