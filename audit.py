@@ -62,6 +62,7 @@ class RepoAudit:
     open_alerts: dict[str, int] | None = None  # None = could not be read
     last_dependabot_run_at: str | None = None
     last_dependabot_run_conclusion: str | None = None
+    last_dependabot_run_job: str | None = None  # e.g. update-graph, dependabot-updates
     open_dependabot_prs: int | None = None
     oldest_dependabot_pr_days: int | None = None
     failures: list[str] = field(default_factory=list)
@@ -200,6 +201,7 @@ def check_dependabot_runs(gh: GitHub, a: RepoAudit) -> None:
     for run in r.json().get("workflow_runs", []):
         if run.get("path", "").startswith("dynamic/dependabot/"):
             a.last_dependabot_run_at = run["created_at"]
+            a.last_dependabot_run_job = run["path"].removeprefix("dynamic/dependabot/")
             a.last_dependabot_run_conclusion = run.get("conclusion") or run.get(
                 "status"
             )

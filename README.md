@@ -19,6 +19,26 @@ Each repo gets a status:
 
 The script exits with code 1 if any repo is FAIL or ERROR.
 
+Summary table columns (`?` or `n/a` means the value couldn't be read; see the Problems column):
+
+| Column | Meaning |
+| --- | --- |
+| Repository | Repo name; forks are marked `(fork)`. |
+| Status | See above. |
+| Alerts on | Whether Dependabot alerts are enabled. |
+| Sec. updates | Whether Dependabot security updates are enabled (`paused` if GitHub has paused them, e.g. after many unmerged PRs). |
+| Ecosystems | Package ecosystems the dependency graph found, which are what Dependabot alerts cover. `—` means none were found. |
+| Open alerts | Open Dependabot alerts by severity: **C**ritical, **H**igh, **M**edium, **L**ow. |
+| Last run | How long ago Dependabot last ran any job in the repo (from its built-in GitHub Actions runs), marked `✗` if that run failed. See below for `none`. |
+| Problems | Every reason behind the status. |
+
+**About `Last run` and `none`:** GitHub doesn't publish when Dependabot last scanned a repo for alerts, so this column shows the closest available signal: the most recent Dependabot job. There are two kinds:
+
+- **Graph updates** (`update-graph`): Dependabot re-resolves the repo's dependencies so the dependency graph, and therefore alerts, stay current. These run routinely, but only for ecosystems where GitHub can't read the full dependency list straight from the files (for example, pip projects without a lock file).
+- **Security updates** (`dependabot-updates`): Dependabot opens a PR to fix an alert. These run only when there is an alert to fix and security updates are on.
+
+So `none` is normal for a repo whose dependencies GitHub reads directly from its files and that has no fixable alerts, and on its own it isn't a problem. It's worth a look if the repo has open alerts and security updates are on but `Last run` is still `none`, or if a run failed (`✗`). The CSV (`--csv`) also has the exact run timestamp, job type and conclusion, plus the count and age of open Dependabot PRs.
+
 ### Token
 
 The script reads a read-only token from `DEPENDABOT_AUDIT_TOKEN`. (The `GITHUB_TOKEN` that Codespaces provides only covers this repo, so it can't be used.)
