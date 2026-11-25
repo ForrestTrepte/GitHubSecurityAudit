@@ -1,0 +1,393 @@
+"""Audit Dependabot alerts and security updates across the repositories you own.
+
+Usage:
+    uv run audit.py              # compact summary table
+    uv run audit.py --csv out.csv  # also write the full detail to a CSV file
+
+Authentication: set DEPENDABOT_AUDIT_TOKEN to a fine-grained personal access token
+with read-only access to all of your repositories (see README.md).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, fields
+from datetime import UTC, datetime
+
+import httpx
+from rich.console import Console
+from rich.table import Table
+
+API = "https://api.github.com"
+TOKEN_ENV = "DEPENDABOT_AUDIT_TOKEN"
+SEVERITIES = ("critical", "high", "medium", "low")
+STALE_PR_DAYS = 30
+
+# purl types (from the dependency-graph SBOM) -> ecosystem names as GitHub shows them.
+ECOSYSTEM_NAMES = {
+    "pypi": "pip",
+    "npm": "npm",
+    "maven": "maven",
+    "nuget": "nuget",
+    "gem": "rubygems",
+    "golang": "go",
+    "cargo": "cargo",
+    "composer": "composer",
+    "githubactions": "actions",
+    "pub": "pub",
+    "swift": "swift",
+    "hex": "hex",
+}
+
+
+class PermissionDenied(Exception):
+    """The token lacks a permission needed for one check."""
+
+
+@dataclass
+class RepoAudit:
+    repo: str
+    url: str
+    fork: bool
+    private: bool
+    alerts_enabled: bool | None = None
+    security_updates_enabled: bool | None = None
+    security_updates_paused: bool | None = None
+    dependency_graph_enabled: bool | None = None
+    ecosystems: list[str] = field(default_factory=list)
+    open_alerts: dict[str, int] | None = None  # None = could not be read
+    last_dependabot_run_at: str | None = None
+    last_dependabot_run_conclusion: str | None = None
+    open_dependabot_prs: int | None = None
+    oldest_dependabot_pr_days: int | None = None
+    failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)  # checks that couldn't run
+
+    @property
+    def status(self) -> str:
+        if self.failures:
+            return "FAIL"
+        if self.errors:
+            return "ERROR"
+        if self.warnings:
+            return "WARN"
+        return "OK"
+
+
+class GitHub:
+    def __init__(self, token: str):
+        self.client = httpx.Client(
+            base_url=API,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30,
+        )
+
+    def get(self, path: str, **params) -> httpx.Response:
+        return self.client.get(path, params=params or None)
+
+    def paginate(self, path: str, **params) -> list[dict]:
+        params.setdefault("per_page", 100)
+        items: list[dict] = []
+        response = self.client.get(path, params=params)
+        while True:
+            if response.status_code == 403:
+                raise PermissionDenied(path)
+            response.raise_for_status()
+            items.extend(response.json())
+            next_url = response.links.get("next", {}).get("url")
+            if not next_url:
+                return items
+            response = self.client.get(next_url)
+
+
+def days_since(timestamp: str) -> int:
+    return (datetime.now(UTC) - datetime.fromisoformat(timestamp)).days
+
+
+def check_alerts_enabled(gh: GitHub, a: RepoAudit) -> None:
+    r = gh.get(f"/repos/{a.repo}/vulnerability-alerts")
+    if r.status_code == 204:
+        a.alerts_enabled = True
+    elif r.status_code == 404:
+        a.alerts_enabled = False
+        a.failures.append("Dependabot alerts disabled")
+    else:
+        a.errors.append(
+            f"can't read alert setting (HTTP {r.status_code}; needs Administration: read)"
+        )
+
+
+def check_security_updates(gh: GitHub, a: RepoAudit) -> None:
+    r = gh.get(f"/repos/{a.repo}/automated-security-fixes")
+    if r.status_code == 200:
+        body = r.json()
+        a.security_updates_enabled = body.get("enabled", False)
+        a.security_updates_paused = body.get("paused", False)
+    elif r.status_code == 404:
+        a.security_updates_enabled = False
+    else:
+        a.errors.append(
+            f"can't read security-update setting (HTTP {r.status_code}; needs Administration: read)"
+        )
+        return
+    if not a.security_updates_enabled:
+        a.failures.append("security updates disabled")
+    elif a.security_updates_paused:
+        a.warnings.append("security updates paused")
+
+
+def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
+    r = gh.get(f"/repos/{a.repo}/dependency-graph/sbom")
+    if r.status_code == 200:
+        a.dependency_graph_enabled = True
+        ecosystems = set()
+        for package in r.json().get("sbom", {}).get("packages", []):
+            for ref in package.get("externalRefs", []):
+                locator = ref.get("referenceLocator", "")
+                if ref.get("referenceType") == "purl" and locator.startswith("pkg:"):
+                    purl_type = locator[4:].split("/", 1)[0]
+                    if purl_type != "github":  # the repo itself
+                        ecosystems.add(ECOSYSTEM_NAMES.get(purl_type, purl_type))
+        a.ecosystems = sorted(ecosystems)
+        if not a.ecosystems:
+            a.failures.append("no dependency manifests detected")
+    elif r.status_code in (403, 404) and "not enabled" in r.text.lower():
+        a.dependency_graph_enabled = False
+        a.failures.append("dependency graph disabled")
+    else:
+        a.errors.append(
+            f"can't read dependency graph (HTTP {r.status_code}; needs Contents: read)"
+        )
+
+
+def check_open_alerts(gh: GitHub, a: RepoAudit) -> None:
+    if a.alerts_enabled is False:
+        return  # the endpoint just returns 403 in this case
+    try:
+        alerts = gh.paginate(f"/repos/{a.repo}/dependabot/alerts", state="open")
+    except PermissionDenied:
+        a.errors.append("can't read Dependabot alerts (needs Dependabot alerts: read)")
+        return
+    counts = dict.fromkeys(SEVERITIES, 0)
+    for alert in alerts:
+        severity = alert.get("security_advisory", {}).get("severity", "low")
+        counts[severity] = counts.get(severity, 0) + 1
+    a.open_alerts = counts
+    serious = counts["critical"] + counts["high"]
+    if serious:
+        a.failures.append(f"{serious} open critical/high alert(s)")
+    elif sum(counts.values()):
+        a.warnings.append(f"{sum(counts.values())} open medium/low alert(s)")
+
+
+def check_dependabot_runs(gh: GitHub, a: RepoAudit) -> None:
+    """Dependabot runs as a built-in ("dynamic") GitHub Actions workflow."""
+    r = gh.get(f"/repos/{a.repo}/actions/runs", event="dynamic", per_page=50)
+    if r.status_code != 200:
+        a.errors.append(
+            f"can't read Actions runs (HTTP {r.status_code}; needs Actions: read)"
+        )
+        return
+    for run in r.json().get("workflow_runs", []):
+        if run.get("path", "").startswith("dynamic/dependabot/"):
+            a.last_dependabot_run_at = run["created_at"]
+            a.last_dependabot_run_conclusion = run.get("conclusion") or run.get(
+                "status"
+            )
+            if run.get("conclusion") == "failure":
+                a.failures.append("last Dependabot run failed")
+            return
+
+
+def check_dependabot_prs(gh: GitHub, a: RepoAudit) -> None:
+    try:
+        prs = gh.paginate(f"/repos/{a.repo}/pulls", state="open")
+    except PermissionDenied:
+        a.errors.append("can't read pull requests (needs Pull requests: read)")
+        return
+    mine = [p for p in prs if p.get("user", {}).get("login") == "dependabot[bot]"]
+    a.open_dependabot_prs = len(mine)
+    if mine:
+        a.oldest_dependabot_pr_days = max(days_since(p["created_at"]) for p in mine)
+        if a.oldest_dependabot_pr_days > STALE_PR_DAYS:
+            a.warnings.append(f"Dependabot PR open {a.oldest_dependabot_pr_days} days")
+
+
+CHECKS = (
+    check_alerts_enabled,
+    check_security_updates,
+    check_dependency_graph,
+    check_open_alerts,
+    check_dependabot_runs,
+    check_dependabot_prs,
+)
+
+
+def audit_repo(gh: GitHub, repo: dict) -> RepoAudit:
+    a = RepoAudit(
+        repo=repo["full_name"],
+        url=repo["html_url"],
+        fork=repo["fork"],
+        private=repo["private"],
+    )
+    for check in CHECKS:
+        try:
+            check(gh, a)
+        except httpx.HTTPError as e:
+            a.errors.append(f"{check.__name__}: {e}")
+    return a
+
+
+# ---------- output ----------
+
+STATUS_STYLE = {
+    "OK": "[green]✅ OK[/]",
+    "WARN": "[yellow]⚠️  WARN[/]",
+    "FAIL": "[red]❌ FAIL[/]",
+    "ERROR": "[magenta]❓ ERROR[/]",
+}
+
+
+def yes_no(value: bool | None) -> str:
+    return {True: "[green]yes[/]", False: "[red]no[/]", None: "[dim]?[/]"}[value]
+
+
+def alerts_cell(a: RepoAudit) -> str:
+    if a.open_alerts is None:
+        return "[dim]n/a[/]"
+    parts = [f"{n} {sev[0].upper()}" for sev, n in a.open_alerts.items() if n]
+    return f"[red]{', '.join(parts)}[/]" if parts else "[green]0[/]"
+
+
+def last_run_cell(a: RepoAudit) -> str:
+    if not a.last_dependabot_run_at:
+        return "[dim]none[/]"
+    text = f"{days_since(a.last_dependabot_run_at)}d ago"
+    return (
+        f"[red]{text} ✗[/]" if a.last_dependabot_run_conclusion == "failure" else text
+    )
+
+
+def print_summary(audits: list[RepoAudit], console: Console) -> None:
+    table = Table(title="Dependabot audit", show_lines=False)
+    table.add_column("Repository", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Alerts on")
+    table.add_column("Sec. updates")
+    table.add_column("Ecosystems")
+    table.add_column("Open alerts")
+    table.add_column("Last run")
+    table.add_column("Problems")
+    for a in audits:
+        name = a.repo.split("/", 1)[1] + (" [dim](fork)[/]" if a.fork else "")
+        sec = yes_no(a.security_updates_enabled)
+        if a.security_updates_paused:
+            sec = "[yellow]paused[/]"
+        table.add_row(
+            name,
+            STATUS_STYLE[a.status],
+            yes_no(a.alerts_enabled),
+            sec,
+            ", ".join(a.ecosystems) or "[dim]—[/]",
+            alerts_cell(a),
+            last_run_cell(a),
+            "; ".join(a.failures + a.warnings + a.errors),
+        )
+    console.print(table)
+    counts = {s: sum(a.status == s for a in audits) for s in STATUS_STYLE}
+    console.print(
+        f"{len(audits)} repos: " + ", ".join(f"{n} {s}" for s, n in counts.items())
+    )
+
+
+def write_csv(audits: list[RepoAudit], path: str) -> None:
+    columns = [
+        f.name
+        for f in fields(RepoAudit)
+        if f.name not in ("open_alerts", "failures", "warnings", "errors")
+    ]
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "status",
+                *columns,
+                *(f"open_{s}" for s in SEVERITIES),
+                "failures",
+                "warnings",
+                "errors",
+            ]
+        )
+        for a in audits:
+            row = [getattr(a, c) for c in columns]
+            row[columns.index("ecosystems")] = " ".join(a.ecosystems)
+            sev = [
+                a.open_alerts.get(s, 0) if a.open_alerts is not None else ""
+                for s in SEVERITIES
+            ]
+            writer.writerow(
+                [
+                    a.status,
+                    *row,
+                    *sev,
+                    "; ".join(a.failures),
+                    "; ".join(a.warnings),
+                    "; ".join(a.errors),
+                ]
+            )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--csv", metavar="PATH", help="also write full per-repo detail to this CSV file"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8, help="repos to audit in parallel (default 8)"
+    )
+    args = parser.parse_args()
+
+    console = Console()
+    token = os.environ.get(TOKEN_ENV)
+    if not token:
+        console.print(
+            f"[red]Set {TOKEN_ENV} to a read-only fine-grained token. See README.md.[/]"
+        )
+        return 2
+
+    gh = GitHub(token)
+    try:
+        repos = gh.paginate("/user/repos", affiliation="owner")
+    except (PermissionDenied, httpx.HTTPStatusError) as e:
+        console.print(f"[red]Could not list repositories: {e}[/]")
+        return 2
+    repos = sorted(
+        (r for r in repos if not r["archived"]), key=lambda r: r["full_name"].lower()
+    )
+
+    with (
+        console.status(f"Auditing {len(repos)} repositories…"),
+        ThreadPoolExecutor(args.workers) as pool,
+    ):
+        audits = list(pool.map(lambda r: audit_repo(gh, r), repos))
+
+    print_summary(audits, console)
+    if args.csv:
+        write_csv(audits, args.csv)
+        console.print(f"Full detail written to {args.csv}")
+    return 1 if any(a.status in ("FAIL", "ERROR") for a in audits) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
