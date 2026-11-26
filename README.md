@@ -15,6 +15,7 @@ Each repo gets a status:
 | ❌ FAIL | Dependabot alerts or security updates are off, the dependency graph is off or finds no manifests, the last Dependabot run failed, or there are open critical/high alerts. |
 | ❓ ERROR | A check couldn't run, usually because the token is missing a permission (the Problems column says which). |
 | ⚠️ WARN | Open medium/low alerts, security updates paused, or a Dependabot PR open for more than 30 days. |
+| ➖ N/A | Dependabot can't scan this repo: it has no ecosystems Dependabot supports, only a project type it doesn't (currently Unity). Settings problems still make it FAIL. |
 | ✅ OK | None of the above. |
 
 The script exits with code 1 if any repo is FAIL or ERROR.
@@ -27,10 +28,10 @@ Summary table columns (`?` or `n/a` means the value couldn't be read; see the Pr
 | Status | See above. |
 | Alerts on | Whether Dependabot alerts are enabled. |
 | Sec. updates | Whether Dependabot security updates are enabled (`paused` if GitHub has paused them, e.g. after many unmerged PRs). |
-| Ecosystems | Package ecosystems the dependency graph found, which are what Dependabot alerts cover. `—` means none were found. |
+| Ecosystems | Package ecosystems the dependency graph found, which are what Dependabot alerts cover. `—` means none were found. Project types Dependabot can't scan are shown dimmed as `(unsupported)`, e.g. `nuget, unity (unsupported)` for a Unity project that also uses NuGet packages. |
 | Open alerts | Open Dependabot alerts by severity: **C**ritical, **H**igh, **M**edium, **L**ow. |
 | Last run | How long ago Dependabot last ran any job in the repo (from its built-in GitHub Actions runs), marked `✗` if that run failed. See below for `none`. |
-| Problems | Every reason behind the status. |
+| Problems | Every reason behind the status, plus notes, e.g. the Unity editor version for Unity projects. |
 
 **About `Last run` and `none`:** GitHub doesn't publish when Dependabot last scanned a repo for alerts, so this column shows the closest available signal: the most recent Dependabot job. There are two kinds:
 

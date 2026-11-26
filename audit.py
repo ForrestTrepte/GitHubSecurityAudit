@@ -43,6 +43,13 @@ ECOSYSTEM_NAMES = {
     "hex": "hex",
 }
 
+# Project types Dependabot can't scan, shown alongside the supported ecosystems.
+# A repo with only these (no supported ecosystems) is N/A rather than FAIL.
+# Map: marker-file suffix -> name shown in the Ecosystems column.
+UNSUPPORTED_MARKERS = {
+    "ProjectSettings/ProjectVersion.txt": "unity",
+}
+
 
 class PermissionDenied(Exception):
     """The token lacks a permission needed for one check."""
@@ -59,6 +66,7 @@ class RepoAudit:
     security_updates_paused: bool | None = None
     dependency_graph_enabled: bool | None = None
     ecosystems: list[str] = field(default_factory=list)
+    unsupported: list[str] = field(default_factory=list)  # e.g. unity
     open_alerts: dict[str, int] | None = None  # None = could not be read
     last_dependabot_run_at: str | None = None
     last_dependabot_run_conclusion: str | None = None
@@ -68,6 +76,7 @@ class RepoAudit:
     failures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)  # checks that couldn't run
+    notes: list[str] = field(default_factory=list)  # informational only
 
     @property
     def status(self) -> str:
@@ -77,6 +86,8 @@ class RepoAudit:
             return "ERROR"
         if self.warnings:
             return "WARN"
+        if self.unsupported and not self.ecosystems:
+            return "N/A"
         return "OK"
 
 
@@ -159,7 +170,8 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
                     if purl_type != "github":  # the repo itself
                         ecosystems.add(ECOSYSTEM_NAMES.get(purl_type, purl_type))
         a.ecosystems = sorted(ecosystems)
-        if not a.ecosystems:
+        detect_unsupported(gh, a)
+        if not a.ecosystems and not a.unsupported:
             a.failures.append("no dependency manifests detected")
     elif r.status_code in (403, 404) and "not enabled" in r.text.lower():
         a.dependency_graph_enabled = False
@@ -168,6 +180,40 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
         a.errors.append(
             f"can't read dependency graph (HTTP {r.status_code}; needs Contents: read)"
         )
+
+
+def detect_unsupported(gh: GitHub, a: RepoAudit) -> None:
+    """Look for project types Dependabot can't scan (see UNSUPPORTED_MARKERS)."""
+    r = gh.get(f"/repos/{a.repo}/git/trees/HEAD", recursive=1)
+    if r.status_code != 200:
+        return  # e.g. 409 for an empty repo: genuinely nothing to scan
+    paths = [t["path"] for t in r.json().get("tree", []) if t["type"] == "blob"]
+    found = {}
+    for marker, name in UNSUPPORTED_MARKERS.items():
+        hits = [p for p in paths if p == marker or p.endswith("/" + marker)]
+        if hits:
+            found[name] = hits
+    a.unsupported = sorted(found)
+    if "unity" in found:
+        versions = sorted(
+            {unity_editor_version(gh, a.repo, p) or "unknown" for p in found["unity"]}
+        )
+        a.notes.append(
+            f"Unity {', '.join(versions)}: Dependabot can't scan Unity packages"
+        )
+
+
+def unity_editor_version(gh: GitHub, repo: str, path: str) -> str | None:
+    r = gh.client.get(
+        f"/repos/{repo}/contents/{path}",
+        headers={"Accept": "application/vnd.github.raw"},
+    )
+    if r.status_code != 200:
+        return None
+    for line in r.text.splitlines():
+        if line.startswith("m_EditorVersion:"):
+            return line.split(":", 1)[1].strip()
+    return None
 
 
 def check_open_alerts(gh: GitHub, a: RepoAudit) -> None:
@@ -256,6 +302,7 @@ STATUS_STYLE = {
     "WARN": "[yellow]⚠️  WARN[/]",
     "FAIL": "[red]❌ FAIL[/]",
     "ERROR": "[magenta]❓ ERROR[/]",
+    "N/A": "[dim]➖ N/A[/]",
 }
 
 
@@ -299,10 +346,13 @@ def print_summary(audits: list[RepoAudit], console: Console) -> None:
             STATUS_STYLE[a.status],
             yes_no(a.alerts_enabled),
             sec,
-            ", ".join(a.ecosystems) or "[dim]—[/]",
+            ", ".join(
+                a.ecosystems + [f"[dim]{u} (unsupported)[/]" for u in a.unsupported]
+            )
+            or "[dim]—[/]",
             alerts_cell(a),
             last_run_cell(a),
-            "; ".join(a.failures + a.warnings + a.errors),
+            "; ".join(a.failures + a.warnings + a.errors + a.notes),
         )
     console.print(table)
     counts = {s: sum(a.status == s for a in audits) for s in STATUS_STYLE}
@@ -312,40 +362,18 @@ def print_summary(audits: list[RepoAudit], console: Console) -> None:
 
 
 def write_csv(audits: list[RepoAudit], path: str) -> None:
-    columns = [
-        f.name
-        for f in fields(RepoAudit)
-        if f.name not in ("open_alerts", "failures", "warnings", "errors")
-    ]
+    columns = [f.name for f in fields(RepoAudit) if f.name != "open_alerts"]
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(
-            [
-                "status",
-                *columns,
-                *(f"open_{s}" for s in SEVERITIES),
-                "failures",
-                "warnings",
-                "errors",
-            ]
-        )
+        writer.writerow(["status", *columns, *(f"open_{s}" for s in SEVERITIES)])
         for a in audits:
             row = [getattr(a, c) for c in columns]
-            row[columns.index("ecosystems")] = " ".join(a.ecosystems)
+            row = ["; ".join(v) if isinstance(v, list) else v for v in row]
             sev = [
                 a.open_alerts.get(s, 0) if a.open_alerts is not None else ""
                 for s in SEVERITIES
             ]
-            writer.writerow(
-                [
-                    a.status,
-                    *row,
-                    *sev,
-                    "; ".join(a.failures),
-                    "; ".join(a.warnings),
-                    "; ".join(a.errors),
-                ]
-            )
+            writer.writerow([a.status, *row, *sev])
 
 
 def main() -> int:
