@@ -26,7 +26,7 @@ Each repo gets a status:
 | Status | Meaning |
 | --- | --- |
 | ❌ FAIL | Dependabot alerts or security updates are off, the dependency graph is off or finds no manifests (see Scope for exceptions), the last Dependabot run failed, or there are open critical/high alerts. |
-| ❓ ERROR | A check couldn't run, usually because the token is missing a permission (the Problems column says which). |
+| ❓ ERROR | A check couldn't run, usually because the token is missing a permission (the Problems column says which), or because GitHub kept rate-limiting it. The script waits and retries rate-limited requests a few times first; if one still fails, run the audit again later or with fewer `--workers`. |
 | ⚠️ WARN | Open medium/low alerts, security updates paused, a Dependabot PR open for more than 30 days, a manifest the dependency graph can't parse or that's too large for it, or a `no-dependencies` repo whose dependency graph found dependencies. |
 | ➖ N/A | Dependabot has nothing to scan in this repo: it has no ecosystems Dependabot supports, and either manifests that list no dependencies, only a project type it doesn't support (currently Unity), or the `no-dependencies` topic and no code. Settings problems still make it FAIL. |
 | ✅ OK | None of the above. |

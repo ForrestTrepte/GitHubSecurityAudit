@@ -14,6 +14,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
@@ -26,6 +27,8 @@ API = "https://api.github.com"
 TOKEN_ENV = "DEPENDABOT_AUDIT_TOKEN"
 SEVERITIES = ("critical", "high", "medium", "low")
 STALE_PR_DAYS = 30
+RATE_LIMIT_RETRIES = 5
+MAX_RATE_LIMIT_WAIT = 120  # seconds; give up rather than wait out a long reset
 
 # purl types (from the dependency-graph SBOM) -> ecosystem names as GitHub shows them.
 ECOSYSTEM_NAMES = {
@@ -57,6 +60,42 @@ NO_DEPENDENCIES_TOPIC = "no-dependencies"
 
 class PermissionDenied(Exception):
     """The token lacks a permission needed for one check."""
+
+
+class RateLimited(Exception):
+    """GitHub kept rate-limiting a request after all retries."""
+
+
+def is_rate_limited(r: httpx.Response) -> bool:
+    if r.status_code == 429:
+        return True
+    if r.status_code == 403:
+        return (
+            r.headers.get("x-ratelimit-remaining") == "0"
+            or "rate limit" in r.text.lower()
+        )
+    if r.status_code == 200 and r.request.url.path == "/graphql":
+        errors = r.json().get("errors") or []
+        return any(e.get("type") == "RATE_LIMITED" for e in errors)
+    return False
+
+
+def rate_limit_wait(r: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retrying, from GitHub's headers if it sent any."""
+    if retry_after := r.headers.get("retry-after"):
+        return float(retry_after)
+    if r.headers.get("x-ratelimit-remaining") == "0" and (
+        reset := r.headers.get("x-ratelimit-reset")
+    ):
+        return max(0.0, float(reset) - time.time()) + 1
+    return 2.0 ** (attempt + 2)  # 4, 8, 16, ... seconds
+
+
+def failure_detail(r: httpx.Response, needs: str | None = None) -> str:
+    """Why a request failed, for the Problems column."""
+    if is_rate_limited(r):
+        return f"HTTP {r.status_code}; rate limited by GitHub, try again later"
+    return f"HTTP {r.status_code}; needs {needs}" if needs else f"HTTP {r.status_code}"
 
 
 @dataclass
@@ -112,19 +151,33 @@ class GitHub:
             timeout=30,
         )
 
+    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Send a request, waiting and retrying while GitHub rate-limits it."""
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            r = self.client.request(method, url, **kwargs)
+            if not is_rate_limited(r) or attempt == RATE_LIMIT_RETRIES:
+                return r
+            wait = rate_limit_wait(r, attempt)
+            if wait > MAX_RATE_LIMIT_WAIT:
+                return r
+            time.sleep(wait)
+        return r
+
     def get(self, path: str, **params) -> httpx.Response:
-        return self.client.get(path, params=params or None)
+        return self.request("GET", path, params=params or None)
 
     def graphql(self, query: str, **variables) -> httpx.Response:
-        return self.client.post(
-            "/graphql", json={"query": query, "variables": variables}
+        return self.request(
+            "POST", "/graphql", json={"query": query, "variables": variables}
         )
 
     def paginate(self, path: str, **params) -> list[dict]:
         params.setdefault("per_page", 100)
         items: list[dict] = []
-        response = self.client.get(path, params=params)
+        response = self.request("GET", path, params=params)
         while True:
+            if is_rate_limited(response):
+                raise RateLimited(path)
             if response.status_code == 403:
                 raise PermissionDenied(path)
             response.raise_for_status()
@@ -132,7 +185,7 @@ class GitHub:
             next_url = response.links.get("next", {}).get("url")
             if not next_url:
                 return items
-            response = self.client.get(next_url)
+            response = self.request("GET", next_url)
 
 
 def days_since(timestamp: str) -> int:
@@ -148,7 +201,7 @@ def check_alerts_enabled(gh: GitHub, a: RepoAudit) -> None:
         a.failures.append("Dependabot alerts disabled")
     else:
         a.errors.append(
-            f"can't read alert setting (HTTP {r.status_code}; needs Administration: read)"
+            f"can't read alert setting ({failure_detail(r, 'Administration: read')})"
         )
 
 
@@ -162,7 +215,8 @@ def check_security_updates(gh: GitHub, a: RepoAudit) -> None:
         a.security_updates_enabled = False
     else:
         a.errors.append(
-            f"can't read security-update setting (HTTP {r.status_code}; needs Administration: read)"
+            "can't read security-update setting "
+            f"({failure_detail(r, 'Administration: read')})"
         )
         return
     if not a.security_updates_enabled:
@@ -200,7 +254,7 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
         a.failures.append("dependency graph disabled")
     else:
         a.errors.append(
-            f"can't read dependency graph (HTTP {r.status_code}; needs Contents: read)"
+            f"can't read dependency graph ({failure_detail(r, 'Contents: read')})"
         )
 
 
@@ -223,7 +277,7 @@ def check_manifests(gh: GitHub, a: RepoAudit) -> bool:
     body = r.json() if r.status_code == 200 else {}
     repo = (body.get("data") or {}).get("repository") or {}
     if "dependencyGraphManifests" not in repo or body.get("errors"):
-        a.errors.append(f"can't read dependency manifests (HTTP {r.status_code})")
+        a.errors.append(f"can't read dependency manifests ({failure_detail(r)})")
         return False
     for m in repo["dependencyGraphManifests"]["nodes"]:
         a.manifests.append(m["filename"])
@@ -249,7 +303,7 @@ def check_no_dependencies(gh: GitHub, a: RepoAudit) -> None:
     # so any language here means there is code that may need dependencies.
     r = gh.get(f"/repos/{a.repo}/languages")
     if r.status_code != 200:
-        a.errors.append(f"can't read languages (HTTP {r.status_code})")
+        a.errors.append(f"can't read languages ({failure_detail(r)})")
         return
     a.languages = sorted(r.json())
     if a.languages:
@@ -283,7 +337,8 @@ def detect_unsupported(gh: GitHub, a: RepoAudit) -> None:
 
 
 def unity_editor_version(gh: GitHub, repo: str, path: str) -> str | None:
-    r = gh.client.get(
+    r = gh.request(
+        "GET",
         f"/repos/{repo}/contents/{path}",
         headers={"Accept": "application/vnd.github.raw"},
     )
@@ -320,7 +375,7 @@ def check_dependabot_runs(gh: GitHub, a: RepoAudit) -> None:
     r = gh.get(f"/repos/{a.repo}/actions/runs", event="dynamic", per_page=50)
     if r.status_code != 200:
         a.errors.append(
-            f"can't read Actions runs (HTTP {r.status_code}; needs Actions: read)"
+            f"can't read Actions runs ({failure_detail(r, 'Actions: read')})"
         )
         return
     for run in r.json().get("workflow_runs", []):
@@ -372,6 +427,10 @@ def audit_repo(gh: GitHub, repo: dict) -> RepoAudit:
             check(gh, a)
         except httpx.HTTPError as e:
             a.errors.append(f"{check.__name__}: {e}")
+        except RateLimited:
+            a.errors.append(
+                f"{check.__name__}: rate limited by GitHub, try again later"
+            )
     return a
 
 
@@ -479,7 +538,7 @@ def main() -> int:
     gh = GitHub(token)
     try:
         repos = gh.paginate("/user/repos", affiliation="owner")
-    except (PermissionDenied, httpx.HTTPStatusError) as e:
+    except (PermissionDenied, RateLimited, httpx.HTTPStatusError) as e:
         console.print(f"[red]Could not list repositories: {e}[/]")
         return 2
     repos = sorted(
