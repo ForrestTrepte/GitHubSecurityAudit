@@ -8,6 +8,17 @@ uv run audit.py                 # summary table of every non-archived repo you o
 uv run audit.py --csv audit.csv # also write the full per-repo detail to a CSV file
 ```
 
+`audit.csv` in this repo holds the latest results and is committed on purpose. It includes private repo names and their alert counts.
+
+### Scope
+
+- **Repos:** only repos you own. Archived repos are skipped; forks are included.
+- **Checked:** Dependabot alerts and security updates. Version updates (`dependabot.yml`) are out of scope for now.
+- **Repos with nothing to scan:** a repo where the dependency graph finds no manifests is FAIL, unless it contains a project type Dependabot can't scan (currently Unity), which makes it N/A.
+- **Not checked:** malware alerts. GitHub's API can't tell whether they're turned on, and there's no account-wide setting for them, so check each repo's Settings → Code security page.
+
+### Statuses
+
 Each repo gets a status:
 
 | Status | Meaning |
@@ -19,6 +30,8 @@ Each repo gets a status:
 | ✅ OK | None of the above. |
 
 The script exits with code 1 if any repo is FAIL or ERROR.
+
+### Columns
 
 Summary table columns (`?` or `n/a` means the value couldn't be read; see the Problems column):
 
@@ -59,3 +72,5 @@ This repo includes a [dev container](.devcontainer/devcontainer.json) with Pytho
 - **Local VS Code:** install the Dev Containers extension and run **Dev Containers: Reopen in Container**.
 
 On first start the container installs uv and creates `.venv` (running `uv sync` once a `pyproject.toml` exists). Add dependencies with `uv add <package>` and run code with `uv run`. Run `claude` in the terminal (or open the Claude Code panel) and sign in.
+
+Lint and format with `uvx ruff check audit.py` and `uvx ruff format audit.py`.
