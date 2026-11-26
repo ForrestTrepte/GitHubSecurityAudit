@@ -14,7 +14,9 @@ uv run audit.py --csv audit.csv # also write the full per-repo detail to a CSV f
 
 - **Repos:** only repos you own. Archived repos are skipped; forks are included.
 - **Checked:** Dependabot alerts and security updates. Version updates (`dependabot.yml`) are out of scope for now.
-- **Repos with nothing to scan:** a repo where the dependency graph finds no manifests is FAIL, unless it contains a project type Dependabot can't scan (currently Unity), which makes it N/A.
+- **Repos with nothing to scan:** a repo where the dependency graph finds no manifests is FAIL, with two exceptions that make it N/A:
+  - it contains a project type Dependabot can't scan (currently Unity), or
+  - it has no dependencies by design (e.g. data files only) and you've given it the `no-dependencies` [topic](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics). The audit checks that this is still true: if GitHub's language stats show any code (they ignore data and prose such as JSON, CSV and Markdown), the repo is FAIL; if the dependency graph finds manifests, it's audited normally and WARN until you remove the topic.
 - **Not checked:** malware alerts. GitHub's API can't tell whether they're turned on, and there's no account-wide setting for them, so check each repo's Settings → Code security page.
 
 ### Statuses
@@ -23,10 +25,10 @@ Each repo gets a status:
 
 | Status | Meaning |
 | --- | --- |
-| ❌ FAIL | Dependabot alerts or security updates are off, the dependency graph is off or finds no manifests, the last Dependabot run failed, or there are open critical/high alerts. |
+| ❌ FAIL | Dependabot alerts or security updates are off, the dependency graph is off or finds no manifests (see Scope for exceptions), the last Dependabot run failed, or there are open critical/high alerts. |
 | ❓ ERROR | A check couldn't run, usually because the token is missing a permission (the Problems column says which). |
-| ⚠️ WARN | Open medium/low alerts, security updates paused, or a Dependabot PR open for more than 30 days. |
-| ➖ N/A | Dependabot can't scan this repo: it has no ecosystems Dependabot supports, only a project type it doesn't (currently Unity). Settings problems still make it FAIL. |
+| ⚠️ WARN | Open medium/low alerts, security updates paused, a Dependabot PR open for more than 30 days, or a `no-dependencies` repo whose dependency graph found manifests. |
+| ➖ N/A | Dependabot has nothing to scan in this repo: it has no ecosystems Dependabot supports, and either only a project type it doesn't (currently Unity) or the `no-dependencies` topic and no code. Settings problems still make it FAIL. |
 | ✅ OK | None of the above. |
 
 The script exits with code 1 if any repo is FAIL or ERROR.

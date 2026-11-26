@@ -50,6 +50,10 @@ UNSUPPORTED_MARKERS = {
     "ProjectSettings/ProjectVersion.txt": "unity",
 }
 
+# Repo topic that marks a repo as having no dependencies by design (e.g. data only).
+# Such a repo is N/A instead of FAIL, as long as GitHub finds no code in it either.
+NO_DEPENDENCIES_TOPIC = "no-dependencies"
+
 
 class PermissionDenied(Exception):
     """The token lacks a permission needed for one check."""
@@ -61,6 +65,8 @@ class RepoAudit:
     url: str
     fork: bool
     private: bool
+    marked_no_dependencies: bool = False  # has the NO_DEPENDENCIES_TOPIC topic
+    languages: list[str] = field(default_factory=list)  # only read when marked
     alerts_enabled: bool | None = None
     security_updates_enabled: bool | None = None
     security_updates_paused: bool | None = None
@@ -86,7 +92,7 @@ class RepoAudit:
             return "ERROR"
         if self.warnings:
             return "WARN"
-        if self.unsupported and not self.ecosystems:
+        if (self.unsupported or self.marked_no_dependencies) and not self.ecosystems:
             return "N/A"
         return "OK"
 
@@ -171,7 +177,9 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
                         ecosystems.add(ECOSYSTEM_NAMES.get(purl_type, purl_type))
         a.ecosystems = sorted(ecosystems)
         detect_unsupported(gh, a)
-        if not a.ecosystems and not a.unsupported:
+        if a.marked_no_dependencies:
+            check_no_dependencies(gh, a)
+        elif not a.ecosystems and not a.unsupported:
             a.failures.append("no dependency manifests detected")
     elif r.status_code in (403, 404) and "not enabled" in r.text.lower():
         a.dependency_graph_enabled = False
@@ -180,6 +188,30 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
         a.errors.append(
             f"can't read dependency graph (HTTP {r.status_code}; needs Contents: read)"
         )
+
+
+def check_no_dependencies(gh: GitHub, a: RepoAudit) -> None:
+    """Verify that a repo marked as having no dependencies really has none."""
+    marked = f"marked {NO_DEPENDENCIES_TOPIC}"
+    if a.ecosystems:
+        a.warnings.append(
+            f"{marked} but dependency graph found {', '.join(a.ecosystems)}"
+        )
+        return
+    # GitHub's language stats ignore data and prose (JSON, CSV, Markdown, ...),
+    # so any language here means there is code that may need dependencies.
+    r = gh.get(f"/repos/{a.repo}/languages")
+    if r.status_code != 200:
+        a.errors.append(f"can't read languages (HTTP {r.status_code})")
+        return
+    a.languages = sorted(r.json())
+    if a.languages:
+        a.failures.append(
+            f"{marked} but has code ({', '.join(a.languages)}) "
+            "and no dependency manifests"
+        )
+    else:
+        a.notes.append("no dependencies (by design)")
 
 
 def detect_unsupported(gh: GitHub, a: RepoAudit) -> None:
@@ -286,6 +318,7 @@ def audit_repo(gh: GitHub, repo: dict) -> RepoAudit:
         url=repo["html_url"],
         fork=repo["fork"],
         private=repo["private"],
+        marked_no_dependencies=NO_DEPENDENCIES_TOPIC in repo.get("topics", []),
     )
     for check in CHECKS:
         try:
