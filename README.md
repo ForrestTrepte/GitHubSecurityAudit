@@ -14,9 +14,9 @@ uv run audit.py --csv audit.csv # also write the full per-repo detail to a CSV f
 
 - **Repos:** only repos you own. Archived repos are skipped; forks are included.
 - **Checked:** Dependabot alerts and security updates. Version updates (`dependabot.yml`) are out of scope for now.
-- **Repos with nothing to scan:** a repo where the dependency graph finds no manifests is FAIL, with two exceptions that make it N/A:
+- **Repos with nothing to scan:** a repo where the dependency graph finds no dependencies is N/A if the graph did find manifest files and they just list none (e.g. a `.csproj` with no NuGet packages; a `.sln` isn't a manifest). If it finds no manifests at all, the repo is FAIL, with two exceptions that make it N/A:
   - it contains a project type Dependabot can't scan (currently Unity), or
-  - it has no dependencies by design (e.g. data files only) and you've given it the `no-dependencies` [topic](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics). The audit checks that this is still true: if GitHub's language stats show any code (they ignore data and prose such as JSON, CSV and Markdown), the repo is FAIL; if the dependency graph finds manifests, it's audited normally and WARN until you remove the topic.
+  - it has no dependencies by design (e.g. data files only) and you've given it the `no-dependencies` [topic](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/classifying-your-repository-with-topics). The audit checks that this is still true: if GitHub's language stats show any code (they ignore data and prose such as JSON, CSV and Markdown), the repo is FAIL; if the dependency graph finds dependencies, it's audited normally and WARN until you remove the topic.
 - **Not checked:** malware alerts. GitHub's API can't tell whether they're turned on, and there's no account-wide setting for them, so check each repo's Settings → Code security page.
 
 ### Statuses
@@ -27,8 +27,8 @@ Each repo gets a status:
 | --- | --- |
 | ❌ FAIL | Dependabot alerts or security updates are off, the dependency graph is off or finds no manifests (see Scope for exceptions), the last Dependabot run failed, or there are open critical/high alerts. |
 | ❓ ERROR | A check couldn't run, usually because the token is missing a permission (the Problems column says which). |
-| ⚠️ WARN | Open medium/low alerts, security updates paused, a Dependabot PR open for more than 30 days, or a `no-dependencies` repo whose dependency graph found manifests. |
-| ➖ N/A | Dependabot has nothing to scan in this repo: it has no ecosystems Dependabot supports, and either only a project type it doesn't (currently Unity) or the `no-dependencies` topic and no code. Settings problems still make it FAIL. |
+| ⚠️ WARN | Open medium/low alerts, security updates paused, a Dependabot PR open for more than 30 days, a manifest the dependency graph can't parse or that's too large for it, or a `no-dependencies` repo whose dependency graph found dependencies. |
+| ➖ N/A | Dependabot has nothing to scan in this repo: it has no ecosystems Dependabot supports, and either manifests that list no dependencies, only a project type it doesn't support (currently Unity), or the `no-dependencies` topic and no code. Settings problems still make it FAIL. |
 | ✅ OK | None of the above. |
 
 The script exits with code 1 if any repo is FAIL or ERROR.
@@ -54,6 +54,8 @@ Summary table columns (`?` or `n/a` means the value couldn't be read; see the Pr
 - **Security updates** (`dependabot-updates`): Dependabot opens a PR to fix an alert. These run only when there is an alert to fix and security updates are on.
 
 So `none` is normal for a repo whose dependencies GitHub reads directly from its files and that has no fixable alerts, and on its own it isn't a problem. It's worth a look if the repo has open alerts and security updates are on but `Last run` is still `none`, or if a run failed (`✗`). The CSV (`--csv`) also has the exact run timestamp, job type and conclusion, plus the count and age of open Dependabot PRs.
+
+The CSV's `manifests` column lists the manifest files the dependency graph found, including ones with no dependencies. They come from GitHub's GraphQL `dependencyGraphManifests` field, because the dependency graph's SBOM only lists packages.
 
 ### Token
 

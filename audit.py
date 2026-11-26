@@ -72,6 +72,7 @@ class RepoAudit:
     security_updates_paused: bool | None = None
     dependency_graph_enabled: bool | None = None
     ecosystems: list[str] = field(default_factory=list)
+    manifests: list[str] = field(default_factory=list)  # files the graph parsed
     unsupported: list[str] = field(default_factory=list)  # e.g. unity
     open_alerts: dict[str, int] | None = None  # None = could not be read
     last_dependabot_run_at: str | None = None
@@ -92,7 +93,9 @@ class RepoAudit:
             return "ERROR"
         if self.warnings:
             return "WARN"
-        if (self.unsupported or self.marked_no_dependencies) and not self.ecosystems:
+        if (
+            self.unsupported or self.manifests or self.marked_no_dependencies
+        ) and not self.ecosystems:
             return "N/A"
         return "OK"
 
@@ -111,6 +114,11 @@ class GitHub:
 
     def get(self, path: str, **params) -> httpx.Response:
         return self.client.get(path, params=params or None)
+
+    def graphql(self, query: str, **variables) -> httpx.Response:
+        return self.client.post(
+            "/graphql", json={"query": query, "variables": variables}
+        )
 
     def paginate(self, path: str, **params) -> list[dict]:
         params.setdefault("per_page", 100)
@@ -176,10 +184,16 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
                     if purl_type != "github":  # the repo itself
                         ecosystems.add(ECOSYSTEM_NAMES.get(purl_type, purl_type))
         a.ecosystems = sorted(ecosystems)
+        if not check_manifests(gh, a):
+            return
         detect_unsupported(gh, a)
         if a.marked_no_dependencies:
             check_no_dependencies(gh, a)
-        elif not a.ecosystems and not a.unsupported:
+        elif a.ecosystems:
+            pass
+        elif a.manifests:
+            a.notes.append(f"no dependencies listed in {', '.join(a.manifests)}")
+        elif not a.unsupported:
             a.failures.append("no dependency manifests detected")
     elif r.status_code in (403, 404) and "not enabled" in r.text.lower():
         a.dependency_graph_enabled = False
@@ -190,6 +204,36 @@ def check_dependency_graph(gh: GitHub, a: RepoAudit) -> None:
         )
 
 
+MANIFESTS_QUERY = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    dependencyGraphManifests(first: 100) {
+      nodes { filename parseable exceedsMaxSize dependenciesCount }
+    }
+  }
+}
+"""
+
+
+def check_manifests(gh: GitHub, a: RepoAudit) -> bool:
+    """List the manifest files the dependency graph found, even ones with no
+    dependencies (the SBOM only lists packages). Returns False if unreadable."""
+    owner, name = a.repo.split("/", 1)
+    r = gh.graphql(MANIFESTS_QUERY, owner=owner, name=name)
+    body = r.json() if r.status_code == 200 else {}
+    repo = (body.get("data") or {}).get("repository") or {}
+    if "dependencyGraphManifests" not in repo or body.get("errors"):
+        a.errors.append(f"can't read dependency manifests (HTTP {r.status_code})")
+        return False
+    for m in repo["dependencyGraphManifests"]["nodes"]:
+        a.manifests.append(m["filename"])
+        if m.get("exceedsMaxSize"):
+            a.warnings.append(f"{m['filename']} too large for the dependency graph")
+        elif not m.get("parseable"):
+            a.warnings.append(f"dependency graph can't parse {m['filename']}")
+    return True
+
+
 def check_no_dependencies(gh: GitHub, a: RepoAudit) -> None:
     """Verify that a repo marked as having no dependencies really has none."""
     marked = f"marked {NO_DEPENDENCIES_TOPIC}"
@@ -197,6 +241,9 @@ def check_no_dependencies(gh: GitHub, a: RepoAudit) -> None:
         a.warnings.append(
             f"{marked} but dependency graph found {', '.join(a.ecosystems)}"
         )
+        return
+    if a.manifests:  # the graph read them and they list no dependencies
+        a.notes.append("no dependencies (by design)")
         return
     # GitHub's language stats ignore data and prose (JSON, CSV, Markdown, ...),
     # so any language here means there is code that may need dependencies.
